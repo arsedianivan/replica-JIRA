@@ -1,0 +1,279 @@
+name: CD - Staging Deployment
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18.x'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Build and Push Docker Images
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    outputs:
+      frontend-image: ${{ steps.meta-frontend.outputs.tags }}
+      backend-image: ${{ steps.meta-backend.outputs.tags }}
+      nginx-image: ${{ steps.meta-nginx.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Frontend Image
+      - name: Extract metadata (Frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=staging-
+            type=raw,value=staging-latest
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.frontend
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Backend Image
+      - name: Extract metadata (Backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=staging-
+            type=raw,value=staging-latest
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Nginx Image
+      - name: Extract metadata (Nginx)
+        id: meta-nginx
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-nginx
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=staging-
+            type=raw,value=staging-latest
+
+      - name: Build and push Nginx image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.nginx
+          push: true
+          tags: ${{ steps.meta-nginx.outputs.tags }}
+          labels: ${{ steps.meta-nginx.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Database Migrations
+  database-migration:
+    name: Run Database Migrations
+    needs: build-images
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+          NODE_ENV: staging
+        run: |
+          # Create backup before migration
+          echo "Creating database backup..."
+          npm run db:backup:staging
+          
+          # Run migrations
+          echo "Running database migrations..."
+          npm run db:migrate
+          
+          # Verify migration success
+          echo "Verifying migrations..."
+          npm run db:verify
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        run: |
+          echo "Migration failed, rolling back..."
+          npm run db:rollback:staging
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-images, database-migration]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-west-2 --name jira-clone-staging
+
+      - name: Deploy to staging
+        env:
+          KUBE_NAMESPACE: jira-clone-staging
+          FRONTEND_IMAGE: ${{ needs.build-images.outputs.frontend-image }}
+          BACKEND_IMAGE: ${{ needs.build-images.outputs.backend-image }}
+          NGINX_IMAGE: ${{ needs.build-images.outputs.nginx-image }}
+        run: |
+          # Update deployment manifests with new image tags
+          envsubst < k8s/staging/frontend-deployment.yaml | kubectl apply -f -
+          envsubst < k8s/staging/backend-deployment.yaml | kubectl apply -f -
+          envsubst < k8s/staging/nginx-deployment.yaml | kubectl apply -f -
+          
+          # Wait for rollout to complete
+          kubectl rollout status deployment/frontend -n $KUBE_NAMESPACE --timeout=600s
+          kubectl rollout status deployment/backend -n $KUBE_NAMESPACE --timeout=600s
+          kubectl rollout status deployment/nginx -n $KUBE_NAMESPACE --timeout=600s
+
+  # Health Checks and Smoke Tests
+  health-checks:
+    name: Health Checks
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for deployment
+        run: sleep 60
+
+      - name: Health check - API
+        run: |
+          curl -f ${{ secrets.STAGING_API_URL }}/health || exit 1
+
+      - name: Health check - Database
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        run: |
+          npm run db:health-check
+
+      - name: Smoke tests
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          npm run test:smoke:staging
+
+      - name: Performance baseline check
+        uses: treosh/lighthouse-ci-action@v10
+        with:
+          urls: |
+            ${{ secrets.STAGING_URL }}
+            ${{ secrets.STAGING_URL }}/login
+            ${{ secrets.STAGING_URL }}/projects
+          configPath: './lighthouserc.staging.js'
+          uploadArtifacts: true
+
+  # Notify deployment status
+  notify:
+    name: Notify Team
+    needs: [deploy-staging, health-checks]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack on success
+        if: needs.health-checks.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: 'Staging deployment successful! 🚀'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify Slack on failure
+        if: needs.health-checks.result == 'failure' || needs.deploy-staging.result == 'failure'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: 'Staging deployment failed! 🚨'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Security scanning on deployed environment
+  security-scan-staging:
+    name: Security Scan Staging
+    needs: health-checks
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: OWASP ZAP security scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: ${{ secrets.STAGING_URL }}
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+      - name: Upload ZAP results
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-results
+          path: report_html.html

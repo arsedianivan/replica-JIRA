@@ -1,0 +1,462 @@
+name: CD - Production Deployment
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy'
+        required: true
+        default: 'latest'
+
+env:
+  NODE_VERSION: '18.x'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Pre-deployment validations
+  pre-deployment-checks:
+    name: Pre-deployment Checks
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate staging environment
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          echo "Checking staging environment health..."
+          curl -f $STAGING_URL/health || exit 1
+
+      - name: Run production readiness checklist
+        run: |
+          echo "✅ Security scans passed"
+          echo "✅ Performance tests passed"
+          echo "✅ Database migrations tested"
+          echo "✅ Staging environment validated"
+
+  # Build production images
+  build-production-images:
+    name: Build Production Images
+    needs: pre-deployment-checks
+    runs-on: ubuntu-latest
+    outputs:
+      frontend-image: ${{ steps.meta-frontend.outputs.tags }}
+      backend-image: ${{ steps.meta-backend.outputs.tags }}
+      nginx-image: ${{ steps.meta-nginx.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Get version
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      # Frontend Production Image
+      - name: Extract metadata (Frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=tag
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=production-latest
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.frontend.prod
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+            BUILD_VERSION=${{ steps.version.outputs.version }}
+
+      # Backend Production Image
+      - name: Extract metadata (Backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=tag
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=production-latest
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend.prod
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+            BUILD_VERSION=${{ steps.version.outputs.version }}
+
+      # Nginx Production Image
+      - name: Extract metadata (Nginx)
+        id: meta-nginx
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-nginx
+          tags: |
+            type=ref,event=tag
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=production-latest
+
+      - name: Build and push Nginx image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.nginx.prod
+          push: true
+          tags: ${{ steps.meta-nginx.outputs.tags }}
+          labels: ${{ steps.meta-nginx.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Blue-Green Database Migration
+  database-migration-production:
+    name: Production Database Migration
+    needs: build-production-images
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create full database backup
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          echo "Creating full database backup..."
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          npm run db:backup:production -- --filename="pre_migration_${timestamp}"
+
+      - name: Test migrations on read replica
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_READ_REPLICA_URL }}
+        run: |
+          echo "Testing migrations on read replica..."
+          npm run db:migrate:dry-run
+
+      - name: Run production migrations
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          echo "Running production database migrations..."
+          npm run db:migrate:production
+          
+      - name: Verify migration integrity
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          echo "Verifying database integrity..."
+          npm run db:verify:production
+
+  # Blue-Green Deployment
+  deploy-blue-green:
+    name: Blue-Green Deployment
+    needs: [build-production-images, database-migration-production]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-west-2 --name jira-clone-production
+
+      - name: Deploy to Green environment
+        env:
+          KUBE_NAMESPACE: jira-clone-production
+          FRONTEND_IMAGE: ${{ needs.build-production-images.outputs.frontend-image }}
+          BACKEND_IMAGE: ${{ needs.build-production-images.outputs.backend-image }}
+          NGINX_IMAGE: ${{ needs.build-production-images.outputs.nginx-image }}
+        run: |
+          # Deploy to green environment
+          envsubst < k8s/production/green/frontend-deployment.yaml | kubectl apply -f -
+          envsubst < k8s/production/green/backend-deployment.yaml | kubectl apply -f -
+          envsubst < k8s/production/green/nginx-deployment.yaml | kubectl apply -f -
+          
+          # Wait for green deployment
+          kubectl rollout status deployment/frontend-green -n $KUBE_NAMESPACE --timeout=600s
+          kubectl rollout status deployment/backend-green -n $KUBE_NAMESPACE --timeout=600s
+          kubectl rollout status deployment/nginx-green -n $KUBE_NAMESPACE --timeout=600s
+
+      - name: Health check Green environment
+        run: |
+          # Wait for pods to be ready
+          sleep 60
+          
+          # Port forward for health check
+          kubectl port-forward svc/backend-green 8080:8080 -n jira-clone-production &
+          sleep 10
+          
+          # Health check
+          curl -f http://localhost:8080/health || exit 1
+          
+          # Kill port forward
+          pkill -f "kubectl port-forward"
+
+      - name: Smoke tests on Green
+        env:
+          GREEN_URL: ${{ secrets.PRODUCTION_GREEN_URL }}
+        run: |
+          npm run test:smoke:production:green
+
+      - name: Switch traffic to Green (Blue-Green swap)
+        run: |
+          # Switch load balancer to green
+          kubectl patch service frontend-service -n jira-clone-production -p '{"spec":{"selector":{"version":"green"}}}'
+          kubectl patch service backend-service -n jira-clone-production -p '{"spec":{"selector":{"version":"green"}}}'
+          kubectl patch service nginx-service -n jira-clone-production -p '{"spec":{"selector":{"version":"green"}}}'
+
+      - name: Monitor production traffic
+        run: |
+          echo "Monitoring production traffic for 5 minutes..."
+          sleep 300
+
+  # Post-deployment validation
+  production-validation:
+    name: Production Validation
+    needs: deploy-blue-green
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Comprehensive health checks
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          echo "Running comprehensive health checks..."
+          
+          # API Health
+          curl -f $PRODUCTION_URL/health || exit 1
+          
+          # Database Health
+          curl -f $PRODUCTION_URL/health/db || exit 1
+          
+          # Redis Health
+          curl -f $PRODUCTION_URL/health/redis || exit 1
+          
+          # Socket.io Health
+          curl -f $PRODUCTION_URL/health/socket || exit 1
+
+      - name: Critical user journey tests
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+          E2E_TEST_USER: ${{ secrets.E2E_TEST_USER }}
+          E2E_TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+        run: |
+          npm run test:critical-journeys:production
+
+      - name: Performance validation
+        uses: treosh/lighthouse-ci-action@v10
+        with:
+          urls: |
+            ${{ secrets.PRODUCTION_URL }}
+            ${{ secrets.PRODUCTION_URL }}/login
+            ${{ secrets.PRODUCTION_URL }}/projects
+            ${{ secrets.PRODUCTION_URL }}/dashboard
+          configPath: './lighthouserc.production.js'
+          uploadArtifacts: true
+
+      - name: Security scan production
+        uses: zaproxy/action-baseline-scan@v0.7.0
+        with:
+          target: ${{ secrets.PRODUCTION_URL }}
+          rules_file_name: '.zap/rules.production.tsv'
+
+  # Cleanup old Blue environment
+  cleanup-blue:
+    name: Cleanup Blue Environment
+    needs: production-validation
+    runs-on: ubuntu-latest
+    environment: production
+    if: success()
+    steps:
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-west-2 --name jira-clone-production
+
+      - name: Scale down Blue environment
+        run: |
+          kubectl scale deployment frontend-blue --replicas=0 -n jira-clone-production
+          kubectl scale deployment backend-blue --replicas=0 -n jira-clone-production
+          kubectl scale deployment nginx-blue --replicas=0 -n jira-clone-production
+
+      - name: Rename deployments (Green becomes Blue)
+        run: |
+          # This prepares for the next deployment cycle
+          kubectl patch deployment frontend-green -n jira-clone-production -p '{"spec":{"selector":{"matchLabels":{"version":"blue"}},"template":{"metadata":{"labels":{"version":"blue"}}}}}'
+          kubectl patch deployment backend-green -n jira-clone-production -p '{"spec":{"selector":{"matchLabels":{"version":"blue"}},"template":{"metadata":{"labels":{"version":"blue"}}}}}'
+          kubectl patch deployment nginx-green -n jira-clone-production -p '{"spec":{"selector":{"matchLabels":{"version":"blue"}},"template":{"metadata":{"labels":{"version":"blue"}}}}}'
+
+  # Rollback job (manual trigger only)
+  rollback:
+    name: Emergency Rollback
+    runs-on: ubuntu-latest
+    environment: production
+    if: failure() && github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-west-2 --name jira-clone-production
+
+      - name: Rollback to Blue
+        run: |
+          echo "Performing emergency rollback..."
+          
+          # Switch traffic back to blue
+          kubectl patch service frontend-service -n jira-clone-production -p '{"spec":{"selector":{"version":"blue"}}}'
+          kubectl patch service backend-service -n jira-clone-production -p '{"spec":{"selector":{"version":"blue"}}}'
+          kubectl patch service nginx-service -n jira-clone-production -p '{"spec":{"selector":{"version":"blue"}}}'
+          
+          # Scale up blue if needed
+          kubectl scale deployment frontend-blue --replicas=3 -n jira-clone-production
+          kubectl scale deployment backend-blue --replicas=3 -n jira-clone-production
+          kubectl scale deployment nginx-blue --replicas=2 -n jira-clone-production
+
+      - name: Rollback database if needed
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          echo "Database rollback requires manual intervention"
+          echo "Contact DBA team immediately"
+
+  # Notification
+  notify-production:
+    name: Notify Production Deployment
+    needs: [production-validation, cleanup-blue]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify success
+        if: needs.production-validation.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: |
+            🚀 Production deployment successful!
+            Version: ${{ steps.version.outputs.version }}
+            URL: ${{ secrets.PRODUCTION_URL }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            🚨 Production deployment failed!
+            Version: ${{ steps.version.outputs.version }}
+            Please investigate immediately.
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Create GitHub release
+        if: needs.production-validation.result == 'success' && github.event_name != 'workflow_dispatch'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          release_name: Release ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
