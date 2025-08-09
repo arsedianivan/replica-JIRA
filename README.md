@@ -1,2 +1,2 @@
-# replica-JIRA
-JIRA Replication Challenge
+# Replica JIRA
+JIRA Replication Challenge using Claude Code
